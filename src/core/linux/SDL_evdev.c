@@ -274,9 +274,6 @@ SDL_EVDEV_Poll(void)
     int i, j, len;
     SDL_evdevlist_item *item;
     SDL_Scancode scan_code;
-    int mouse_button;
-    SDL_Mouse *mouse;
-    float norm_x, norm_y, norm_pressure;
 
     if (!_this) {
         return;
@@ -286,22 +283,30 @@ SDL_EVDEV_Poll(void)
     SDL_UDEV_Poll();
 #endif
 
-    mouse = SDL_GetMouse();
-
     for (item = _this->first; item != NULL; item = item->next) {
         while ((len = read(item->fd, events, (sizeof events))) > 0) {
             len /= sizeof(events[0]);
             for (i = 0; i < len; ++i) {
             	struct input_event *event = &events[i];
             	
-                /* special handling for touchscreen, that should eventually be
-                   used for all devices */
-                if (item->out_of_sync && item->is_touchscreen &&
-                    events[i].type == EV_SYN && events[i].code != SYN_REPORT) {
-                    break;
+                if (item->out_of_sync) {
+                    if (event->type == EV_SYN && event->code == SYN_REPORT) {
+                        item->out_of_sync = SDL_FALSE;
+                        SDL_EVDEV_sync_device(item);
+                        /* Process this SYN_REPORT below. */
+                    } else {
+                        continue;
+                    }
                 }
 
-                switch (events[i].type) {
+                if (event->type == EV_SYN && event->code == SYN_DROPPED) {
+                    if (item->is_touchscreen) {
+                        item->out_of_sync = SDL_TRUE;
+                    }
+                    continue;
+                }
+
+                switch (event->type) {
                 case EV_KEY:
                 	if (item->is_touchscreen &&
                         (event->code == BTN_TOUCH || event->code == BTN_LEFT)) {
@@ -309,7 +314,7 @@ SDL_EVDEV_Poll(void)
                         break;
                     }
 
-                    if (item->device_class & 0x10) {
+                    if (item->device_class & 0x02) {
                         scan_code = SDL_EVDEV_translate_keycode(event->code);
 
                         if (scan_code != SDL_SCANCODE_UNKNOWN) {
@@ -515,128 +520,51 @@ SDL_EVDEV_destroy_touchscreen(SDL_evdevlist_item* item) {
 }
 
 static void
-SDL_EVDEV_sync_device(SDL_evdevlist_item *item) 
+SDL_EVDEV_sync_device(SDL_evdevlist_item *item)
 {
-#ifdef EVIOCGMTSLOTS
-    int i, ret;
     struct input_absinfo abs_info;
-    /*
-     * struct input_mt_request_layout {
-     *     __u32 code;
-     *     __s32 values[num_slots];
-     * };
-     *
-     * this is the structure we're trying to emulate
-     */
-    Uint32* mt_req_code;
-    Sint32* mt_req_values;
-    size_t mt_req_size;
+    unsigned long keybits[(KEY_MAX / (sizeof(unsigned long) * 8)) + 1];
+    const unsigned int bits_per_long = (unsigned int)(sizeof(unsigned long) * 8);
+    int ret;
 
-    /* TODO: sync devices other than touchscreen */
-    if (!item->is_touchscreen)
-        return;
-
-    mt_req_size = sizeof(*mt_req_code) +
-        sizeof(*mt_req_values) * item->touchscreen_data->max_slots;
-
-    mt_req_code = SDL_calloc(1, mt_req_size);
-    if (mt_req_code == NULL) {
+    if (!item->is_touchscreen) {
         return;
     }
 
-    mt_req_values = (Sint32*)mt_req_code + 1;
-
-    *mt_req_code = ABS_MT_TRACKING_ID;
-    ret = ioctl(item->fd, EVIOCGMTSLOTS(mt_req_size), mt_req_code);
+    ret = ioctl(item->fd, EVIOCGABS(ABS_X), &abs_info);
     if (ret < 0) {
-        SDL_free(mt_req_code);
-        return;
+        ret = ioctl(item->fd, EVIOCGABS(ABS_MT_POSITION_X), &abs_info);
     }
-    for(i = 0; i < item->touchscreen_data->max_slots; i++) {
-        /*
-         * This doesn't account for the very edge case of the user removing their
-         * finger and replacing it on the screen during the time we're out of sync,
-         * which'll mean that we're not going from down -> up or up -> down, we're
-         * going from down -> down but with a different tracking id, meaning we'd
-         * have to tell SDL of the two events, but since we wait till SYN_REPORT in
-         * SDL_EVDEV_Poll to tell SDL, the current structure of this code doesn't
-         * allow it. Lets just pray to God it doesn't happen.
-         */
-        if (item->touchscreen_data->slots[i].tracking_id < 0 &&
-            mt_req_values[i] >= 0) {
-            item->touchscreen_data->slots[i].tracking_id = mt_req_values[i];
-            item->touchscreen_data->slots[i].delta = EVDEV_TOUCH_SLOTDELTA_DOWN;
-        } else if (item->touchscreen_data->slots[i].tracking_id >= 0 &&
-            mt_req_values[i] < 0) {
-            item->touchscreen_data->slots[i].tracking_id = -1;
-            item->touchscreen_data->slots[i].delta = EVDEV_TOUCH_SLOTDELTA_UP;
-        }
+    if (ret >= 0) {
+        item->mouse_x = abs_info.value;
+        item->touch_have_x = SDL_TRUE;
     }
 
-    *mt_req_code = ABS_MT_POSITION_X;
-    ret = ioctl(item->fd, EVIOCGMTSLOTS(mt_req_size), mt_req_code);
+    ret = ioctl(item->fd, EVIOCGABS(ABS_Y), &abs_info);
     if (ret < 0) {
-        SDL_free(mt_req_code);
-        return;
+        ret = ioctl(item->fd, EVIOCGABS(ABS_MT_POSITION_Y), &abs_info);
     }
-    for(i = 0; i < item->touchscreen_data->max_slots; i++) {
-        if (item->touchscreen_data->slots[i].tracking_id >= 0 &&
-            item->touchscreen_data->slots[i].x != mt_req_values[i]) {
-            item->touchscreen_data->slots[i].x = mt_req_values[i];
-            if (item->touchscreen_data->slots[i].delta ==
-                EVDEV_TOUCH_SLOTDELTA_NONE) {
-                item->touchscreen_data->slots[i].delta =
-                    EVDEV_TOUCH_SLOTDELTA_MOVE;
-            }
-        }
+    if (ret >= 0) {
+        item->mouse_y = abs_info.value;
+        item->touch_have_y = SDL_TRUE;
     }
 
-    *mt_req_code = ABS_MT_POSITION_Y;
-    ret = ioctl(item->fd, EVIOCGMTSLOTS(mt_req_size), mt_req_code);
-    if (ret < 0) {
-        SDL_free(mt_req_code);
-        return;
-    }
-    for(i = 0; i < item->touchscreen_data->max_slots; i++) {
-        if (item->touchscreen_data->slots[i].tracking_id >= 0 &&
-            item->touchscreen_data->slots[i].y != mt_req_values[i]) {
-            item->touchscreen_data->slots[i].y = mt_req_values[i];
-            if (item->touchscreen_data->slots[i].delta ==
-                EVDEV_TOUCH_SLOTDELTA_NONE) {
-                item->touchscreen_data->slots[i].delta =
-                    EVDEV_TOUCH_SLOTDELTA_MOVE;
-            }
-        }
+    if (item->touch_have_x && item->touch_have_y) {
+        item->touch_position_changed = SDL_TRUE;
     }
 
-    *mt_req_code = ABS_MT_PRESSURE;
-    ret = ioctl(item->fd, EVIOCGMTSLOTS(mt_req_size), mt_req_code);
-    if (ret < 0) {
-        SDL_free(mt_req_code);
-        return;
-    }
-    for(i = 0; i < item->touchscreen_data->max_slots; i++) {
-        if (item->touchscreen_data->slots[i].tracking_id >= 0 &&
-            item->touchscreen_data->slots[i].pressure != mt_req_values[i]) {
-            item->touchscreen_data->slots[i].pressure = mt_req_values[i];
-            if (item->touchscreen_data->slots[i].delta ==
-                EVDEV_TOUCH_SLOTDELTA_NONE) {
-                item->touchscreen_data->slots[i].delta =
-                    EVDEV_TOUCH_SLOTDELTA_MOVE;
-            }
-        }
-    }
+    SDL_memset(keybits, 0, sizeof(keybits));
+    ret = ioctl(item->fd, EVIOCGKEY(sizeof(keybits)), keybits);
+    if (ret >= 0) {
+        SDL_bool btn_touch;
+        SDL_bool btn_left;
 
-    ret = ioctl(item->fd, EVIOCGABS(ABS_MT_SLOT), &abs_info);
-    if (ret < 0) {
-        SDL_free(mt_req_code);
-        return;
+        btn_touch = (keybits[BTN_TOUCH / bits_per_long] &
+                     (1UL << (BTN_TOUCH % bits_per_long))) ? SDL_TRUE : SDL_FALSE;
+        btn_left = (keybits[BTN_LEFT / bits_per_long] &
+                    (1UL << (BTN_LEFT % bits_per_long))) ? SDL_TRUE : SDL_FALSE;
+        item->touch_down = (btn_touch || btn_left) ? SDL_TRUE : SDL_FALSE;
     }
-    item->touchscreen_data->current_slot = abs_info.value;
-
-    SDL_free(mt_req_code);
-
-#endif /* EVIOCGMTSLOTS */
 }
 
 int
