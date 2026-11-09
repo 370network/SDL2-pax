@@ -293,7 +293,6 @@ SDL_EVDEV_Poll(void)
                     if (event->type == EV_SYN && event->code == SYN_REPORT) {
                         item->out_of_sync = SDL_FALSE;
                         SDL_EVDEV_sync_device(item);
-                        /* Process this SYN_REPORT below. */
                     } else {
                         continue;
                     }
@@ -367,10 +366,16 @@ SDL_EVDEV_Poll(void)
                     if (event->code == SYN_REPORT && item->is_touchscreen) {
                         SDL_Window *win;
 
-                        win = SDL_GetWindowFromID(1);
+                        win = SDL_GetMouseFocus();
+                        if (!win) {
+                            win = SDL_GetWindowFromID(1);
+                            if (win) {
+                                SDL_SetMouseFocus(win);
+                            }
+                        }
+
                         if (win) {
-                            SDL_SetMouseFocus(win);
-                            
+                        
                             if (item->touch_position_changed &&
                                 item->touch_have_x && item->touch_have_y) {
                                 SDL_SendMouseMotion(win, (SDL_MouseID)item->fd, 0, item->mouse_x, item->mouse_y);
@@ -384,6 +389,7 @@ SDL_EVDEV_Poll(void)
                         }
                     }
                     break;
+                    
                 }
             }
         }    
