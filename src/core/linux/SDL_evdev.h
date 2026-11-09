@@ -31,6 +31,7 @@
 extern int SDL_EVDEV_Init(void);
 extern void SDL_EVDEV_Quit(void);
 extern void SDL_EVDEV_Poll(void);
+extern int SDL_EVDEV_device_added(const char *dev_path, int udev_class);
 
 #endif /* SDL_INPUT_LINUXEV */
 
