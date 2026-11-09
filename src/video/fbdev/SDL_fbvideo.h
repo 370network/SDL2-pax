@@ -25,17 +25,13 @@
 #include "../../SDL_internal.h"
 #include "../SDL_sysvideo.h"
 
-#include "GLES/gl.h"
-#include "EGL/egl.h"
-#include "EGL/eglext.h"
-
 typedef struct SDL_WindowData
 {
-#if SDL_VIDEO_OPENGL_EGL  
-    EGLSurface egl_surface;
-#else
-    int foo;
-#endif
+    int fb_fd;           
+    Uint8 *fb_mem;       
+    size_t fb_mem_len;   
+    int fb_pitch;        
+    SDL_Surface *surface;
 } SDL_WindowData;
 
 /****************************************************************************/
@@ -66,16 +62,10 @@ void FB_DestroyWindow(_THIS, SDL_Window * window);
 SDL_bool FB_GetWindowWMInfo(_THIS, SDL_Window * window,
                              struct SDL_SysWMinfo *info);
 
-/* OpenGL/OpenGL ES functions */
-int FB_GLES_LoadLibrary(_THIS, const char *path);
-void *FB_GLES_GetProcAddress(_THIS, const char *proc);
-void FB_GLES_UnloadLibrary(_THIS);
-SDL_GLContext FB_GLES_CreateContext(_THIS, SDL_Window * window);
-int FB_GLES_MakeCurrent(_THIS, SDL_Window * window, SDL_GLContext context);
-int FB_GLES_SetSwapInterval(_THIS, int interval);
-int FB_GLES_GetSwapInterval(_THIS);
-int FB_GLES_SwapWindow(_THIS, SDL_Window * window);
-void FB_GLES_DeleteContext(_THIS, SDL_GLContext context);
+/* fbdev create/update/destroywindowfb, based on dummy */
+int FB_CreateWindowFramebuffer(_THIS, SDL_Window * window, Uint32 * format, void ** pixels, int *pitch);
+int FB_UpdateWindowFramebuffer(_THIS, SDL_Window * window, const SDL_Rect * rects, int numrects);
+void FB_DestroyWindowFramebuffer(_THIS, SDL_Window * window);
 
 #endif /* __SDL_FBVIDEO_H__ */
 

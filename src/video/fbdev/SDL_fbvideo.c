@@ -34,9 +34,16 @@
 #endif
 
 #include "SDL_fbvideo.h"
-#include "SDL_fbopengles.h"
 #include "../../events/SDL_mouse_c.h"
 #include "../../events/SDL_keyboard_c.h"
+
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <linux/fb.h>
 
 static void
 FB_PumpEvents(_THIS)
@@ -92,15 +99,9 @@ FB_Create()
     device->SetWindowGrab = FB_SetWindowGrab;
     device->DestroyWindow = FB_DestroyWindow;
     device->GetWindowWMInfo = FB_GetWindowWMInfo;
-    device->GL_LoadLibrary = FB_GLES_LoadLibrary;
-    device->GL_GetProcAddress = FB_GLES_GetProcAddress;
-    device->GL_UnloadLibrary = FB_GLES_UnloadLibrary;
-    device->GL_CreateContext = FB_GLES_CreateContext;
-    device->GL_MakeCurrent = FB_GLES_MakeCurrent;
-    device->GL_SetSwapInterval = FB_GLES_SetSwapInterval;
-    device->GL_GetSwapInterval = FB_GLES_GetSwapInterval;
-    device->GL_SwapWindow = FB_GLES_SwapWindow;
-    device->GL_DeleteContext = FB_GLES_DeleteContext;
+    device->CreateWindowFramebuffer = FB_CreateWindowFramebuffer;
+    device->UpdateWindowFramebuffer = FB_UpdateWindowFramebuffer;
+    device->DestroyWindowFramebuffer = FB_DestroyWindowFramebuffer;
 
     device->PumpEvents = FB_PumpEvents;
 
@@ -185,19 +186,7 @@ FB_CreateWindow(_THIS, SDL_Window * window)
     window->w = display->desktop_mode.w;
     window->h = display->desktop_mode.h;
 
-    /* OpenGL ES is the law here, buddy */
-    window->flags |= SDL_WINDOW_OPENGL;
-
-    if (!_this->egl_data) {
-        if (SDL_GL_LoadLibrary(NULL) < 0) {
-            return -1;
-        }
-    }
-
-    wdata->egl_surface = SDL_EGL_CreateSurface(_this, 0);
-    if (wdata->egl_surface == EGL_NO_SURFACE) {
-        return SDL_SetError("Could not create GLES window surface");
-    }
+    wdata->fb_fd = -1;
 
     /* Setup driver data for this window */
     window->driverdata = wdata;
@@ -217,10 +206,6 @@ FB_DestroyWindow(_THIS, SDL_Window * window)
 
     if(window->driverdata) {
         data = (SDL_WindowData *) window->driverdata;
-        if (data->egl_surface != EGL_NO_SURFACE) {
-            SDL_EGL_DestroySurface(_this, data->egl_surface);
-            data->egl_surface = EGL_NO_SURFACE;
-        }
         SDL_free(window->driverdata);
         window->driverdata = NULL;
     }
@@ -294,6 +279,119 @@ FB_GetWindowWMInfo(_THIS, SDL_Window * window, struct SDL_SysWMinfo *info)
 
     /* Failed to get window manager information */
     return SDL_FALSE;
+}
+
+int
+FB_CreateWindowFramebuffer(_THIS, SDL_Window * window, Uint32 * format, void ** pixels, int *pitch)
+{
+    SDL_WindowData *wdata = (SDL_WindowData *) window->driverdata;
+    struct fb_var_screeninfo vinfo;
+    struct fb_fix_screeninfo finfo;
+    Uint32 px_format;
+
+    if (wdata->fb_fd < 0) {
+        wdata->fb_fd = open("/dev/fb", O_RDWR);
+        if (wdata->fb_fd < 0) {
+            return SDL_SetError("Could not open fb: %s", strerror(errno));
+        }
+    }
+
+    if (ioctl(wdata->fb_fd, FBIOGET_VSCREENINFO, &vinfo) < 0 ||
+        ioctl(wdata->fb_fd, FBIOGET_FSCREENINFO, &finfo) < 0) {
+        return SDL_SetError("FBIOGET_*SCREENINFO on fb failed: %s", strerror(errno));
+    }
+
+    switch (vinfo.bits_per_pixel) {
+        case 32:
+            px_format = SDL_PIXELFORMAT_ARGB8888;
+            break;
+        case 24:
+            px_format = SDL_PIXELFORMAT_RGB888;
+            break;
+        case 16:
+        default:
+            px_format = SDL_PIXELFORMAT_RGB565;
+            break;
+    }
+
+    wdata->fb_mem_len = finfo.smem_len;
+    wdata->fb_mem = (Uint8 *) mmap(NULL, wdata->fb_mem_len, PROT_READ | PROT_WRITE,
+                                    MAP_SHARED, wdata->fb_fd, 0);
+    if (wdata->fb_mem == MAP_FAILED) {
+        wdata->fb_mem = NULL;
+        return SDL_SetError("mmap(fb) failed: %s", strerror(errno));
+    }
+    wdata->fb_pitch = finfo.line_length;
+
+    wdata->surface = SDL_CreateRGBSurfaceWithFormat(0, window->w, window->h, 0, px_format);
+    if (!wdata->surface) {
+        return -1;
+    }
+
+    *format = px_format;
+    *pixels = wdata->surface->pixels;
+    *pitch = wdata->surface->pitch;
+
+    return 0;
+}
+
+int
+FB_UpdateWindowFramebuffer(_THIS, SDL_Window * window, const SDL_Rect * rects, int numrects)
+{
+    SDL_WindowData *wdata = (SDL_WindowData *) window->driverdata;
+    int i;
+
+    if (!wdata->fb_mem || !wdata->surface) {
+        return SDL_SetError("Framebuffer not initialized");
+    }
+
+    for (i = 0; i < numrects; i++) {
+        const SDL_Rect *rect = &rects[i];
+        int bpp = wdata->surface->format->BytesPerPixel;
+        int row_bytes = rect->w * bpp;
+        int y;
+
+        if (rect->w <= 0 || rect->h <= 0) {
+            continue;
+        }
+
+        for (y = rect->y; y < rect->y + rect->h; y++) {
+            Uint8 *src;
+            Uint8 *dst;
+
+            if (y < 0 || y >= window->h) {
+                continue;
+            }
+            src = (Uint8 *) wdata->surface->pixels + y * wdata->surface->pitch + rect->x * bpp;
+            dst = wdata->fb_mem + y * wdata->fb_pitch + rect->x * bpp;
+            SDL_memcpy(dst, src, row_bytes);
+        }
+    }
+
+    return 0;
+}
+
+void
+FB_DestroyWindowFramebuffer(_THIS, SDL_Window * window)
+{
+    SDL_WindowData *wdata = (SDL_WindowData *) window->driverdata;
+
+    if (!wdata) {
+        return;
+    }
+
+    if (wdata->surface) {
+        SDL_FreeSurface(wdata->surface);
+        wdata->surface = NULL;
+    }
+    if (wdata->fb_mem) {
+        munmap(wdata->fb_mem, wdata->fb_mem_len);
+        wdata->fb_mem = NULL;
+    }
+    if (wdata->fb_fd >= 0) {
+        close(wdata->fb_fd);
+        wdata->fb_fd = -1;
+    }
 }
 
 #endif /* SDL_VIDEO_DRIVER_FBDEV */
